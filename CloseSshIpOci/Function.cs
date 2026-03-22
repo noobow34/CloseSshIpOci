@@ -6,9 +6,10 @@ using Oci.Common.Model;
 using Oci.CoreService;
 using Oci.CoreService.Models;
 using Oci.CoreService.Requests;
+using System.Net.Http.Headers;
+using System.Text;
 using System.Text.Json;
 
-// Assembly attribute to enable the Lambda function's JSON input to be converted into a .NET class.
 [assembly: LambdaSerializer(typeof(Amazon.Lambda.Serialization.SystemTextJson.DefaultLambdaJsonSerializer))]
 
 namespace CloseSshIpOci;
@@ -21,12 +22,6 @@ public class Function
     private static readonly string TENANCY_ID = Environment.GetEnvironmentVariable("OCI_TENANCY_ID") ?? throw new InvalidOperationException("OCI_TENANCY_ID is not set");
     private static readonly string PRIVATE_KEY = Environment.GetEnvironmentVariable("OCI_PRIVATE_KEY") ?? throw new InvalidOperationException("OCI_PRIVATE_KEY is not set");
 
-    /// <summary>
-    /// A simple function that takes a string and does a ToUpper
-    /// </summary>
-    /// <param name="input">The event for the Lambda function handler to process.</param>
-    /// <param name="context">The ILambdaContext that provides methods for logging and describing the Lambda environment.</param>
-    /// <returns></returns>
     public async Task<APIGatewayProxyResponse> FunctionHandlerAsync(JsonElement input, ILambdaContext context)
     {
         try
@@ -37,6 +32,7 @@ public class Function
             if (string.IsNullOrEmpty(createdSlistId))
             {
                 context.Logger.LogWarning("[WARN] security_list_id が空です");
+                await SendSlackNotificationAsync(":warning: *close-ssh 失敗*\n`security_list_id` が空です。", context);
                 return new APIGatewayProxyResponse
                 {
                     StatusCode = 400,
@@ -99,6 +95,11 @@ public class Function
 
             context.Logger.LogInformation($"[INFO] close-ssh 正常終了: security_list_id={createdSlistId}");
 
+            await SendSlackNotificationAsync(
+                $":white_check_mark: *close-ssh 成功*\nセキュリティリスト `{createdSlistId}` を削除し、SSHアクセスを閉じました。",
+                context
+            );
+
             return new APIGatewayProxyResponse
             {
                 StatusCode = 200,
@@ -119,6 +120,11 @@ public class Function
                 _ => (500, "Internal Server Error")
             };
 
+            await SendSlackNotificationAsync(
+                $":x: *close-ssh 失敗*\n`{errorType}`: {ex.Message}",
+                context
+            );
+
             return new APIGatewayProxyResponse
             {
                 StatusCode = statusCode,
@@ -130,6 +136,46 @@ public class Function
                     requestId = context.AwsRequestId
                 })
             };
+        }
+    }
+
+    private static async Task SendSlackNotificationAsync(string message, ILambdaContext context)
+    {
+        try
+        {
+            var token = Environment.GetEnvironmentVariable("SLACK_BOT_TOKEN");
+            var channelId = Environment.GetEnvironmentVariable("SLACK_CHANNEL");
+
+            if (string.IsNullOrEmpty(token) || string.IsNullOrEmpty(channelId))
+            {
+                context.Logger.LogWarning("[WARN] SLACK_BOT_TOKEN または SLACK_CHANNEL が未設定のため、Slack通知をスキップします");
+                return;
+            }
+
+            var payload = new
+            {
+                channel = channelId,
+                text = message
+            };
+            using var client = new HttpClient();
+            client.DefaultRequestHeaders.Authorization =
+                new AuthenticationHeaderValue("Bearer", token);
+            var json = JsonSerializer.Serialize(payload);
+            var content = new StringContent(json, Encoding.UTF8, "application/json");
+            var response = await client.PostAsync(
+                "https://slack.com/api/chat.postMessage",
+                content
+            );
+
+            if (!response.IsSuccessStatusCode)
+            {
+                context.Logger.LogWarning($"[WARN] Slack通知失敗: HTTP {(int)response.StatusCode}");
+            }
+        }
+        catch (Exception ex)
+        {
+            // Slack通知の失敗はメイン処理に影響させない
+            context.Logger.LogWarning($"[WARN] Slack通知中に例外: {ex.Message}");
         }
     }
 }
